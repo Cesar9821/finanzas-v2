@@ -17,10 +17,8 @@ export async function addTransaction(formData: FormData): Promise<void> {
   let amount = amountRaw ? parseFloat(amountRaw as string) : 0;
   if (isNaN(amount) || amount === 0) return;
 
-  // Normalizar monto: negativo para gastos, positivo para ingresos
   amount = type === 'expense' ? -Math.abs(amount) : Math.abs(amount);
 
-  // 1. Inserción de la Transacción
   const { error: txError } = await supabase
     .from('transactions')
     .insert([{
@@ -35,7 +33,7 @@ export async function addTransaction(formData: FormData): Promise<void> {
 
   if (txError) throw new Error(`Error en DB: ${txError.message}`);
 
-  // 2. ACTUALIZACIÓN INTELIGENTE DEL CRÉDITO
+  // BUG FIX: Actualizar credito con logica correcta basada en saldo real
   if (destination === 'credit' && credit_id) {
     const { data: credit } = await supabase
       .from('credits')
@@ -44,36 +42,32 @@ export async function addTransaction(formData: FormData): Promise<void> {
       .single();
 
     if (credit) {
-      const paymentAmount = Math.abs(amount); 
+      const paymentAmount = Math.abs(amount);
       const currentRemaining = Number(credit.remaining_amount) || 0;
       const vCuota = Number(credit.installment_value) || 0;
-      
-      // Cálculo de nuevo saldo
-      const newRemaining = Math.max(0, currentRemaining - paymentAmount);
-      
-      // LÓGICA DE CUOTAS: 
-      // Calculamos cuántas cuotas completas cubre este pago. 
-      // Si el pago es menor a una cuota, solo sumamos 1 si el saldo baja significativamente.
-      const cuotasPagadasEnEsteActo = vCuota > 0 ? Math.floor(paymentAmount / vCuota) : 1;
-      const totalPaidUpdated = (credit.paid_installments || 0) + (cuotasPagadasEnEsteActo || 1);
+      const totalInst = Number(credit.total_installments) || 1;
 
-      // Si el saldo llega a 0, lo eliminamos automáticamente
+      const newRemaining = Math.max(0, currentRemaining - paymentAmount);
+
+      // Calcular cuotas pagadas basado en saldo consumido (no en numero de pagos)
+      const newPaidInstallments = vCuota > 0
+        ? Math.min(totalInst, Math.round((totalInst * vCuota - newRemaining) / vCuota))
+        : Number(credit.paid_installments) || 0;
+
       if (newRemaining <= 0) {
         await supabase.from('credits').delete().eq('id', credit_id);
       } else {
         await supabase
           .from('credits')
-          .update({ 
-            paid_installments: Math.min(totalPaidUpdated, credit.total_installments),
+          .update({
+            paid_installments: newPaidInstallments,
             remaining_amount: newRemaining,
-            remaining_balance: newRemaining // Sincronizamos ambos campos
           })
           .eq('id', credit_id);
       }
     }
   }
 
-  // 3. ACTUALIZACIÓN DE AHORROS
   if ((destination === 'saving' || destination === 'withdraw_saving') && saving_id) {
     const { data: saving } = await supabase
       .from('savings')
@@ -84,8 +78,8 @@ export async function addTransaction(formData: FormData): Promise<void> {
     if (saving) {
       const currentSaving = Number(saving.current_amount) || 0;
       const txAmount = Math.abs(amount);
-      const newAmount = destination === 'withdraw_saving' 
-        ? currentSaving - txAmount 
+      const newAmount = destination === 'withdraw_saving'
+        ? currentSaving - txAmount
         : currentSaving + txAmount;
 
       await supabase
@@ -95,11 +89,11 @@ export async function addTransaction(formData: FormData): Promise<void> {
     }
   }
 
-  // Revalidación masiva para asegurar que todo el dashboard se actualice
   revalidatePath('/transactions');
   revalidatePath('/credits');
   revalidatePath('/savings');
   revalidatePath('/dashboard');
+  revalidatePath('/performance');
 }
 
 export async function deleteTransaction(id: string): Promise<void> {
@@ -115,32 +109,32 @@ export async function deleteTransaction(id: string): Promise<void> {
 
   const absAmount = Math.abs(tx.amount);
 
-  // REVERTIR CRÉDITOS
   if (tx.destination === 'credit' && tx.credit_id) {
     const { data: credit } = await supabase
       .from('credits')
-      .select('remaining_amount, paid_installments, installment_value')
+      .select('remaining_amount, paid_installments, installment_value, total_installments')
       .eq('id', tx.credit_id)
       .single();
 
     if (credit) {
       const vCuota = Number(credit.installment_value) || 0;
-      const cuotasARestar = vCuota > 0 ? Math.floor(absAmount / vCuota) : 1;
-      
+      const totalInst = Number(credit.total_installments) || 1;
       const restoredBalance = Number(credit.remaining_amount) + absAmount;
-      
+
+      const newPaidInstallments = vCuota > 0
+        ? Math.max(0, Math.round((totalInst * vCuota - restoredBalance) / vCuota))
+        : Math.max(0, (credit.paid_installments || 0) - 1);
+
       await supabase
         .from('credits')
         .update({
           remaining_amount: restoredBalance,
-          remaining_balance: restoredBalance,
-          paid_installments: Math.max(0, (credit.paid_installments || 0) - (cuotasARestar || 1))
+          paid_installments: newPaidInstallments,
         })
         .eq('id', tx.credit_id);
     }
   }
 
-  // REVERTIR AHORROS
   if ((tx.destination === 'saving' || tx.destination === 'withdraw_saving') && tx.saving_id) {
     const { data: saving } = await supabase
       .from('savings')
@@ -167,4 +161,5 @@ export async function deleteTransaction(id: string): Promise<void> {
   revalidatePath('/dashboard');
   revalidatePath('/savings');
   revalidatePath('/credits');
+  revalidatePath('/performance');
 }

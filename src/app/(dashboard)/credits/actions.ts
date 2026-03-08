@@ -36,3 +36,10 @@ export async function addCredit(formData: FormData): Promise<void> {
   revalidatePath('/credits');
   revalidatePath('/transactions');
 }
+export async function deleteCredit(id: string): Promise<void> {
+  const supabase = await createClient();
+  await supabase.from('credits').delete().eq('id', id);
+  revalidatePath('/credits');
+  revalidatePath('/dashboard');
+  revalidatePath('/performance');
+}
